@@ -1,0 +1,241 @@
+name: OpenWrt-CI
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - README.md
+      - LICENSE
+      - CNAME
+      - CHANGELOG.md
+      - .github/**
+      - .gitignore
+      - .npmrc
+      - .prettierrc
+      - .eslintrc
+
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - README.md
+      - LICENSE
+      - CNAME
+      - CHANGELOG.md
+      - .github/**
+      - .gitignore
+      - .npmrc
+      - .prettierrc
+      - .eslintrc
+
+  workflow_dispatch:
+    inputs:
+      up_branch:
+        description: Upstream Branch
+        required: false
+        default: 'v22.03.05'
+      platform:
+        description: Target Platform (os/arch)
+        required: false
+        default: 'linux/amd64, linux/arm64'
+
+
+permissions:
+  contents: read
+
+jobs:
+  handle-dispatch:
+    name: Process Workflow Dispatch
+    if: ${{ github.event.inputs != null }}
+    runs-on: ubuntu-latest
+    outputs:
+      up_branch: ${{ steps.format-input.outputs.up_branch }}
+      platform: ${{ steps.format-input.outputs.platform }}
+    steps:
+      - name: Format input
+        id: format-input
+        run: |
+          up_branch="[\"$(
+              echo "${{ github.event.inputs.up_branch }}" | sed 's/"/\\"/g' |
+              sed 's/^[ \t]*//g;s/[ \t]*$//g;s/[ \t][ \t]*/ /g;s/ *, */","/g'
+            )\"]"
+          platform="[\"$(
+              echo "${{ github.event.inputs.platform }}" | sed 's/"/\\"/g' |
+              sed 's/^[ \t]*//g;s/[ \t]*$//g;s/[ \t][ \t]*/ /g;s/ *, */","/g'
+            )\"]"
+          echo "up_branch=$up_branch" >> $GITHUB_OUTPUT
+          echo "platform=$platform" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build OpenWrt
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
+    needs: handle-dispatch
+    if: always() && (needs.handle-dispatch.result == 'success' || needs.handle-dispatch.result == 'skipped')
+
+    strategy:
+      fail-fast: false
+      matrix:
+        up_branch: ${{ fromJson(needs.handle-dispatch.outputs.up_branch || '["auto"]') }}
+        platform: ${{ fromJson(needs.handle-dispatch.outputs.platform || '["auto"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Collect information
+        run: |
+          # Add permission
+          echo Adding permission
+          find ./.github -type f -name "*.sh" -exec chmod +x {} \;
+
+          # Dispatch event
+          echo Handling dispatch event
+          if [ "${{ needs.handle-dispatch.result == 'success' }}" = "true" ]; then
+            export BUILD_UP_BRANCH="${{ matrix.up_branch }}"
+            export BUILD_PLATFORM="${{ matrix.platform }}"
+            echo "======================="
+            echo -e "\033[1;36mBuild information:\033[0m"
+            echo "-----------------------"
+            echo -e "\033[34mUpstream branch:\033[0m $BUILD_UP_BRANCH"
+            echo -e "\033[34mTarget Platform:\033[0m $(echo "$BUILD_PLATFORM" | sed 's/  */, /g')"
+            echo "======================="
+          fi
+
+          # Format apt-packages.txt
+          echo Formatting apt-packages.txt
+          sed 's/^[ \t]*//g;s/[ \t]*$//g;/^$/d' apt-packages.txt | sort -u -o apt-packages.txt
+
+      - name: Cache apt packages
+        id: cache-apt
+        uses: actions/cache@v3
+        with:
+          path: |
+            /var/cache/apt/archives/*
+            !/var/cache/apt/archives/partial
+            !/var/cache/apt/archives/lock
+            /var/lib/apt/lists/*
+            !/var/lib/apt/lists/partial
+            !/var/lib/apt/lists/lock
+          key: ${{ runner.os }}-apt-${{ hashFiles('apt-packages.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Cleanup space and initialize environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          echo ::group::"Cleaning docker images"
+          docker rmi `docker images -q`
+          echo ::endgroup::
+          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
+          echo ::group::"Updating apt packages"
+          sudo -E apt-mark hold grub-efi-amd64-signed
+          sudo -E apt update
+          echo ::endgroup::
+          echo ::group::"Removing apt packages"
+          sudo -E apt -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* dotnet* snap*
+          echo ::endgroup::
+          if [ "${{ steps.cache-apt.outputs.cache-hit }}" = "true" ]; then
+            echo ::group::"Upgrading apt packages"
+            sudo -E apt -y full-upgrade
+            echo ::endgroup::
+          else
+            echo ::group::"Upgrading apt packages"
+            sudo -E apt -y full-upgrade
+            echo ::endgroup::
+            echo ::group::"Installing apt packages"
+            sudo -E apt -y install $(tr '\n' ' ' < apt-packages.txt)
+            echo ::endgroup::
+          fi
+          sudo -E systemctl daemon-reload
+          echo ::group::"Cleaning apt packages"
+          sudo -E apt -y autoremove --purge
+          sudo -E apt clean
+          echo ::endgroup::
+          sudo -E timedatectl set-timezone ${{ env.TZ }}
+
+      - name: Merge repository
+        run: |
+          ./.github/shell/merge-repo.sh
+
+      - name: Update Feeds
+        run: |
+          echo ::group::"Updating feeds"
+          ./scripts/feeds update -a
+          echo ::endgroup::
+          echo ::group::"Installing feeds"
+          ./scripts/feeds install -a
+          echo ::endgroup::
+
+      - name: Generate configuration file
+        run: |
+          [ -f "seed.config" ] && \
+          cat seed.config | tee -a .config > /dev/null
+          make defconfig
+
+      - name: Download packages
+        run: make download -j16
+
+      - name: Compile
+        run: |
+          echo ::group::"Compiling \(multi-thread\)"
+          make -j$(nproc) || {
+            echo ::endgroup::
+            echo ::error::"Compiling failed, start retrying"
+            echo ::group::"Compiling \(single-thread, log\)"
+            make -j1 V=s
+          }
+          echo ::endgroup::
+          echo ::group::"Statistics"
+          echo "======================="
+          echo -e "\033[1;36mSpace usage:\033[0m"
+          echo "======================="
+          df -h
+          echo "-----------------------"
+          du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin
+          du -h --max-depth=1 ./build_dir
+          du -h --max-depth=1 ./bin
+          echo "======================="
+          echo ::endgroup::
+
+      - name: Create docker images
+        run: |
+          ./.github/shell/gen-docker-img.sh
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p ./artifact/package
+          mkdir -p ./artifact/buildinfo
+          rm -rf $(find ./bin/targets/ -type d -name "packages")
+          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
+          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+
+      - name: Upload buildinfo
+        uses: actions/upload-artifact@v3
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+
+      - name: Upload package
+        uses: actions/upload-artifact@v3
+        with:
+          name: OpenWrt_package
+          path: ./artifact/package/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v3
+        with:
+          name: OpenWrt_firmware
+          path: ./bin/targets/
+
+      - name: Upload docker
+        uses: actions/upload-artifact@v3
+        with:
+          name: OpenWrt_docker
+          path: ./bin/docker/
