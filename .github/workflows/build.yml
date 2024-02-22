@@ -45,23 +45,34 @@ permissions:
   contents: read
 
 jobs:
-  handle-dispatch:
-    name: Process Workflow Dispatch
-    if: ${{ github.event.inputs != null }}
+  handle-param:
+    name: Handle Parameters
     runs-on: ubuntu-latest
     outputs:
       up_branch: ${{ steps.format-input.outputs.up_branch }}
       platform: ${{ steps.format-input.outputs.platform }}
+    env:
+      DEFAULT_UP_BRANCH: 'v22.03.05'
+      DEFAULT_PLATFORM: 'linux/arm64'
     steps:
       - name: Format input
         id: format-input
         run: |
+          if [ "${{ github.event.inputs != null }}" = "true"]; then
+            echo Using workflow dispatch input
+            input_up_branch="${{ github.event.inputs.up_branch }}"
+            input_platform="${{ github.event.inputs.platform }}"
+          else
+            echo Using default input
+            input_up_branch="$DEFAULT_UP_BRANCH"
+            input_platform="$DEFAULT_PLATFORM"
+          fi
           up_branch="[\"$(
-              echo "${{ github.event.inputs.up_branch }}" | sed 's/"/\\"/g' |
+              echo "$input_up_branch" | sed 's/"/\\"/g' |
               sed 's/^[ \t]*//g;s/[ \t]*$//g;s/[ \t][ \t]*/ /g;s/ *, */","/g'
             )\"]"
           platform="[\"$(
-              echo "${{ github.event.inputs.platform }}" | sed 's/"/\\"/g' |
+              echo "$input_platform" | sed 's/"/\\"/g' |
               sed 's/^[ \t]*//g;s/[ \t]*$//g;s/[ \t][ \t]*/ /g;s/ *, */","/g'
             )\"]"
           echo "up_branch=$up_branch" >> $GITHUB_OUTPUT
@@ -72,14 +83,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-    needs: handle-dispatch
-    if: always() && (needs.handle-dispatch.result == 'success' || needs.handle-dispatch.result == 'skipped')
+    needs: handle-param
+    ### if: always() && (needs.handle-param.result == 'success' || needs.handle-param.result == 'skipped')
 
     strategy:
       fail-fast: false
       matrix:
-        up_branch: ${{ fromJson(needs.handle-dispatch.outputs.up_branch || '["auto"]') }}
-        platform: ${{ fromJson(needs.handle-dispatch.outputs.platform || '["auto"]') }}
+        up_branch: ${{ fromJson(needs.handle-param.outputs.up_branch) }}
+        platform: ${{ fromJson(needs.handle-param.outputs.platform) }}
 
     steps:
       - name: Checkout
@@ -96,7 +107,7 @@ jobs:
 
           # Dispatch event
           echo Handling dispatch event
-          if [ "${{ needs.handle-dispatch.result == 'success' }}" = "true" ]; then
+          ### if [ "${{ needs.handle-param.result == 'success' }}" = "true" ]; then
             export BUILD_UP_BRANCH="${{ matrix.up_branch }}"
             export BUILD_PLATFORM="${{ matrix.platform }}"
             echo "======================="
@@ -105,7 +116,7 @@ jobs:
             echo -e "\033[34mUpstream branch:\033[0m $BUILD_UP_BRANCH"
             echo -e "\033[34mTarget Platform:\033[0m $(echo "$BUILD_PLATFORM" | sed 's/  */, /g')"
             echo "======================="
-          fi
+          ### fi
 
           # Format apt-packages.txt
           echo Formatting apt-packages.txt
